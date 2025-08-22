@@ -1,0 +1,247 @@
+# 安裝套件（含 tqdm 進度列）
+!pip -q install requests pdfplumber pandas openpyxl xmltodict tqdm
+
+import re, io, json, time, requests, pdfplumber, pandas as pd
+from google.colab import files
+from tqdm.auto import tqdm
+
+# ========= 參數區 =========
+# ① 路線清單（含 stopAddrUrl）的資源：你的原始 rid
+ROUTE_BASE_URL = "https://opendata.tycg.gov.tw/api/v1/dataset.api_access?rid=06073bd9-7ce3-4107-899a-ae63d29e0267&format=json"
+
+# ② 「桃園市市區公車動態」資料集內資源（用來建立『業者對照表』的來源）
+#    來源：dataset.search 找到 pid，再用 resource.info 取得唯一資源的 rid=4303aab9-ec73-49a1-8420-f477a45df87f
+OP_BASE_URL    = "https://opendata.tycg.gov.tw/api/v1/dataset.api_access?rid=4303aab9-ec73-49a1-8420-f477a45df87f&format=json"
+
+# 下載節流（避免過快被限流）
+REQUEST_SLEEP_SEC = 0.2
+
+# ========= 共用工具 =========
+def fetch_pages(base_url, limit=1000, start_offset=0, max_pages=200, show_progress=True):
+    """一般化分頁抓取（JSON 為主，失敗時以 XML 解析），直到回傳空集合或不足一頁為止。"""
+    all_rows, offset = [], start_offset
+    for page in range(max_pages):
+        url = f"{base_url}&limit={limit}&offset={offset}"
+        if show_progress:
+            print(f"[抓取] 第 {page+1} 頁（offset={offset}）…", end="")
+        r = requests.get(url, timeout=60)
+        r.raise_for_status()
+        try:
+            data = r.json()
+            batch = []
+            if isinstance(data, dict):
+                # 常見結構：{"result":{"records":[...]}}
+                if isinstance(data.get("result"), dict) and isinstance(data["result"].get("records"), list):
+                    batch = data["result"]["records"]
+                else:
+                    # 其他常見鍵
+                    for k in ("data","items","records","Results","rows"):
+                        if isinstance(data.get(k), list):
+                            batch = data[k]; break
+                    if not batch:
+                        batch = data if isinstance(data, list) else []
+            else:
+                batch = data if isinstance(data, list) else []
+        except json.JSONDecodeError:
+            # XML fallback：將 XML 轉為 dict，扁平化蒐集所有 dict 節點
+            import xmltodict
+            x = xmltodict.parse(r.text)
+            pool = []
+            def walk(v):
+                if isinstance(v, list): pool.extend(v)
+                elif isinstance(v, dict):
+                    for _k,_v in v.items(): walk(_v)
+            walk(x)
+            batch = [d for d in pool if isinstance(d, dict)]
+        if show_progress:
+            print(f" 取得 {len(batch)} 筆")
+        if not batch:
+            break
+        all_rows.extend(batch)
+        if len(batch) < limit:
+            break
+        offset += limit
+        time.sleep(REQUEST_SLEEP_SEC)
+    return all_rows
+
+def normalize_keys(row):
+    return { (k.lower() if isinstance(k,str) else k): v for k,v in row.items() }
+
+def safe_get(d, *keys):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return str(d[k])
+    return ""
+
+def fetch_pdf(url):
+    try:
+        r = requests.get(url, timeout=60)
+        r.raise_for_status()
+        return r.content
+    except Exception:
+        if url.startswith("http://"):
+            alt = "https://" + url[len("http://"):]
+            r = requests.get(alt, timeout=60); r.raise_for_status()
+            return r.content
+        raise
+
+# ========= PDF 站址表解析 =========
+ENTRY_RE = re.compile(r'(\d+)\s+(.+?)\s+([0-9]{2}\.[0-9]+)\s+([0-9]{3}\.[0-9]+)')
+
+def parse_stop_pdf(pdf_bytes):
+    left, right = [], []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        text = "\n".join(p.extract_text(x_tolerance=2, y_tolerance=2) or "" for p in pdf.pages)
+    for raw in text.splitlines():
+        line = " ".join(raw.split())
+        if not line or line.startswith(("站序","GPS")) or "站址表" in line:
+            continue
+        ms = list(ENTRY_RE.finditer(line))
+        for i in range(0, len(ms), 2):
+            m  = ms[i]
+            seq, nameaddr, lat, lon = int(m.group(1)), m.group(2), float(m.group(3)), float(m.group(4))
+            name, addr = (nameaddr.split(None,1)+[""])[:2]
+            left.append({"StopSequence": seq, "StopName_Zh": name, "Address": addr, "Lat": lat, "Lon": lon})
+            if i+1 < len(ms):
+                m2 = ms[i+1]
+                seq2, nameaddr2, lat2, lon2 = int(m2.group(1)), m2.group(2), float(m2.group(3)), float(m2.group(4))
+                name2, addr2 = (nameaddr2.split(None,1)+[""])[:2]
+                right.append({"StopSequence": seq2, "StopName_Zh": name2, "Address": addr2, "Lat": lat2, "Lon": lon2})
+    left.sort(key=lambda x: x["StopSequence"])
+    right.sort(key=lambda x: x["StopSequence"])
+    return left, right
+
+# ========= 實作方式 B：建立『業者對照表』 =========
+# 支援多種分隔符：半形/全形逗號、斜線、分號、豎線、頓號
+OP_SPLIT_RE = re.compile(r"[,\uFF0C/;|\uFF5C、]+")
+
+def build_operator_lookup(op_base_url):
+    """
+    從『桃園市市區公車動態』資源建立 {OperatorID/ProviderID: OperatorName} 對照表。
+    會自動容錯鍵名，若同一 ID 出現多個名稱版本，保留「較長」者（通常較完整）。
+    """
+    op_name_by_id = {}
+    ops_raw = fetch_pages(op_base_url, limit=1000, start_offset=0, show_progress=True)
+    ops = [normalize_keys(o) for o in ops_raw]
+    for o in ops:
+        # 常見鍵名容錯
+        oid = (safe_get(o, "operatorid","providerid","provider_id","opid","companyid","operator_id") or "").strip()
+        onm = (safe_get(o, "operatorname","providername","provider_name","namezh","name","operatorname_zh","providername_zh") or "").strip()
+        if not oid:
+            continue
+        # 若同 ID 多版本名稱，保留較長者
+        if oid not in op_name_by_id or len(onm) > len(op_name_by_id[oid]):
+            op_name_by_id[oid] = onm
+    print("[INFO] 業者對照表筆數：", len(op_name_by_id))
+    # 簡單 sanity check：列出前 10 筆
+    head_items = list(op_name_by_id.items())[:10]
+    if head_items:
+        print("[DEBUG] 業者對照表前幾筆：", head_items)
+    return op_name_by_id
+
+def map_operator_names(op_id_raw, lookup):
+    """把 '1001,1002' 這類多值 ID，轉成 '業者A、業者B'；對映不到則保留原 ID。"""
+    if not op_id_raw:
+        return ""
+    parts = [p.strip() for p in OP_SPLIT_RE.split(op_id_raw) if p.strip()]
+    names = [lookup.get(pid, pid) for pid in parts]
+    return "、".join(names)
+
+def pick_operator_id(row):
+    """從路線 JSON 抓出業者代碼（名稱可能沒有）。"""
+    return (safe_get(row, "operatorid","providerid","provider_id","opid","companyid","operator_id") or "").strip()
+
+# ========= 主流程 =========
+# A. 建立『業者對照表』
+op_name_by_id = build_operator_lookup(OP_BASE_URL)
+
+# B. 抓路線清單（含 stopAddrUrl），準備解析 PDF
+routes_raw = fetch_pages(ROUTE_BASE_URL, limit=1000, start_offset=0, show_progress=True)
+routes = [normalize_keys(r) for r in routes_raw]
+print("[INFO] 路線清單總數：", len(routes))
+if routes:
+    print("[INFO] 第一筆鍵：", list(routes[0].keys()))
+
+rows = []
+ok = miss_pdf = 0
+has_id_cnt = mapped_cnt = 0
+
+pbar = tqdm(routes, desc="下載與解析站址表（含補業者名稱）", unit="條路線")
+for r in pbar:
+    route_no = (safe_get(r, "route","masterrouteno")).strip()
+    nameZh   = (safe_get(r, "namezh","masterroutename")).strip()
+    dep      = (safe_get(r, "departurezh","from")).strip()
+    dest     = (safe_get(r, "destinationzh","to")).strip()
+    pdf_url  = (safe_get(r, "stopaddrurl","stop_address_url")).strip()
+
+    # 只拿 ID，名稱靠對照表補
+    op_id = pick_operator_id(r)
+    op_nm = ""
+    source = "missing"
+    if op_id:
+        has_id_cnt += 1
+        op_nm = map_operator_names(op_id, op_name_by_id)
+        source = "lookup" if op_nm else "missing"
+
+    if not pdf_url:
+        miss_pdf += 1
+        tqdm.write(f"[略過] 無 stopaddrurl：{route_no or nameZh}")
+        continue
+
+    try:
+        pdf = fetch_pdf(pdf_url)
+        left, right = parse_stop_pdf(pdf)
+
+        if op_id and op_nm:
+            mapped_cnt += 1
+
+        for it in left:
+            it.update({
+                "Route": route_no or nameZh,
+                "RouteName_Zh": nameZh,
+                "Direction": 0,
+                "DirectionLabel": f"往 {dest}" if dest else "去程",
+                "From": dep, "To": dest,
+                "OperatorId": op_id,
+                "OperatorName": op_nm,
+                "OperatorSource": source
+            })
+        for it in right:
+            it.update({
+                "Route": route_no or nameZh,
+                "RouteName_Zh": nameZh,
+                "Direction": 1,
+                "DirectionLabel": f"往 {dep}" if dep else "返程",
+                "From": dep, "To": dest,
+                "OperatorId": op_id,
+                "OperatorName": op_nm,
+                "OperatorSource": source
+            })
+
+        rows.extend(left); rows.extend(right); ok += 1
+        pbar.set_postfix({
+            "parsed_routes": ok,
+            "total_stops": len(rows),
+            "op_with_id": has_id_cnt,
+            "op_mapped_name": mapped_cnt
+        })
+    except Exception as e:
+        tqdm.write(f"[WARN] 下載/解析失敗：{(route_no or nameZh)} → {e}")
+
+print(f"[INFO] 無 stopaddrurl 的路線：{miss_pdf}；成功解析路線數：{ok}；站點總筆數：{len(rows)}")
+print(f"[INFO] 有 OperatorId 的路線數：{has_id_cnt}；成功補到名稱的路線數：{mapped_cnt}")
+
+# ========= 匯出 =========
+cols = [
+    "Route","RouteName_Zh","Direction","DirectionLabel",
+    "StopSequence","StopName_Zh","Address","Lat","Lon","From","To",
+    "OperatorId","OperatorName","OperatorSource"
+]
+df = pd.DataFrame(rows, columns=cols)
+if not df.empty:
+    df.sort_values(["Route","Direction","StopSequence"], inplace=True)
+
+out = "taoyuan_citybus_stops_OpenData_with_operator_lookup.xlsx"
+df.to_excel(out, index=False)
+print("[OK] 產出", out, f"（{len(df)} 列）")
+files.download(out)
