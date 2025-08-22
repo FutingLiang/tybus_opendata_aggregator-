@@ -2,7 +2,6 @@
 
 本專案為一個專門針對桃園市政府開放資料平台的公車資料整合工具，採用 ETL (Extract, Transform, Load) 架構設計。系統能夠自動化地從多個 API 端點抓取公車路線、業者資訊與站點資料，並進行資料清洗、轉換與整併，最終產出結構化的資料集供後續分析使用。
 
-**主要腳本**: `c:\Users\root\Desktop\tybus_opendata_aggregator.py`
 
 ## 系統架構概覽
 
